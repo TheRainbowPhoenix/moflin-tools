@@ -180,15 +180,44 @@ def decode_actcb(d):
     return rows
 
 def decode_actlist(d):
-    """ActList: 16-byte records, byte0 = opcode. Returns list of dicts (raw + guesses)."""
-    recs = []
-    for o in range(0, len(d) - 15, 16):
-        r = d[o:o+16]
-        recs.append({
-            'op': r[0], 'raw': r.hex(' '),
-            'u32': struct.unpack_from('<4I', d, o),
+    """ActList entry stream (32-byte rows). Reverse-engineered so far:
+
+    Row = [b0][refs...][terminator 0xff][params...]
+      - b0: entry index within the list (0,1,2,... sequential)
+      - refs: 3-byte records, TWO variants observed:
+            (id u16, type u8)   -- most common (fits 522/626 rows cleanly)
+            (type u8, id u8, param u8) -- variant rows
+      - ref types:  0x14 = motion/script reference (id often tbl<<8|file_id)
+                    0x15 = unknown (LED/eye? sub-call?)
+                    0x16 = play sound  (ids 0-106 = VW wave index; VERIFIED:
+                            List_23 'KubiNade' plays sounds 45-62 = natuki/
+                            sakebi/kuse bonding sounds)
+      - 0xff terminates the ref list; remaining bytes = params
+      - ActCB rows reference these lists: (0x14, List_N) e.g. KubiNade CB
+        -> List_23, Oyasumi CB -> List_21 (chain: sensor CB -> List -> motions+sounds)
+    Returns list of dicts.
+    """
+    entries = []
+    for o in range(0, len(d) - 31, 32):
+        r = d[o:o+32]
+        refs_main, p = [], 1
+        while p + 2 < 16:
+            t = r[p+2]
+            if t == 0xff:
+                break
+            if t in (0x14, 0x15, 0x16):
+                refs_main.append({'kind': 'id16', 'id': r[p] | r[p+1] << 8, 'type': t})
+            else:
+                refs_main.append({'kind': 'raw', 'bytes': r[p:p+3].hex()})
+            p += 3
+        entries.append({
+            'index': r[0],
+            'refs': refs_main,
+            'terminated': p < 16 and r[p] == 0xff,
+            'tail': r[p:].hex(' '),
+            'raw': r.hex(' '),
         })
-    return recs
+    return entries
 
 def show_motion(m, name):
     print(f"motion '{name}': n={m['n']} -> {len(m['frames'])} keyframes (dt_ms, pos_a, pos_b)")
@@ -201,11 +230,19 @@ def show_actcb(rows, name):
         print(f"  [{i:3d}] idx={r[0]:#010x} param_a={r[1]:#010x} param_b={r[2]:#010x} rest={r[3:]}")
 
 def show_actlist(recs, name):
-    print(f"actlist '{name}': {len(recs)} records (16-byte VM records, semantics TBD)")
-    for i, r in enumerate(recs[:64]):
-        print(f"  [{i:3d}] op={r['op']:#04x} raw={r['raw']}  u32={r['u32']}")
-    if len(recs) > 64:
-        print(f"  ... {len(recs)-64} more")
+    print(f"actlist '{name}': {len(recs)} entries")
+    KIND = {0x14: 'motion', 0x15: 'unk15', 0x16: 'sound'}
+    for e in recs[:40]:
+        parts = []
+        for rf in e['refs']:
+            if rf['kind'] == 'id16':
+                parts.append(f"{KIND.get(rf['type'], hex(rf['type']))}:{rf['id']}")
+            else:
+                parts.append(f"raw({rf['bytes']})")
+        term = '' if e['terminated'] else ' !NOTERM'
+        print(f"  [{e['index']:3d}] {' '.join(parts) or '-'}{term}  tail={e['tail']}")
+    if len(recs) > 40:
+        print(f"  ... {len(recs)-40} more")
 
 def auto_show(path):
     """Show a single extracted file with auto-detected decoding."""
@@ -295,10 +332,14 @@ def cmd_show(container, needle):
             if needle.lower() in name.lower():
                 wstart = s.get('wstart', s['start']) if s['tag'] == 'VW' else s['start']
                 data = d[wstart+off:wstart+off+size]
-                tmp = os.path.join('__show__.bin')
-                open(tmp, 'wb').write(data)
-                auto_show(tmp)
-                os.remove(tmp)
+                # fake a filename so auto_show can detect the type
+                ext = '.txt' if name.strip(':').endswith('txt') else '.bin'
+                fake = os.path.join(f"{s['tag']}_{sanitize(name)}{ext}")
+                open(fake, 'wb').write(data)
+                try:
+                    auto_show(fake)
+                finally:
+                    os.remove(fake)
                 return
     # maybe it's a wav by index name
     print(f"no file matching '{needle}'")
